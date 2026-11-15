@@ -13,6 +13,9 @@
 启动：双击 原神养成记录助手.exe（打包版），或命令行 python genshin-helper.py
 """
 import hashlib
+import base64
+import ctypes
+from ctypes import wintypes
 import json
 import re
 import os
@@ -30,6 +33,11 @@ PORT = int(os.environ.get("HELPER_PORT", "8642"))
 HERE = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
 BASE = getattr(sys, "_MEIPASS", HERE)               # PyInstaller 打包后资源目录
 INDEX_HTML = os.path.join(BASE, "index.html")
+APP_DATA = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "genshin-roster")
+os.makedirs(APP_DATA, exist_ok=True)
+HEARTBEAT_TIMEOUT = 20
+LAST_HEARTBEAT = time.time()
+HEARTBEAT_LOCK = threading.Lock()
 # ---------------- UID 展柜同步（Enka 线路，无需登录） ----------------
 # 数据源：enka.network/api/uid/{uid}（国内直连常被墙，走多线路赛跑 + 磁盘缓存兜底）
 # 名字解析：Enka 官方 store/gi/locs.json（zh-cn，含全部角色/武器名的 Enka hash 映射）
@@ -199,6 +207,7 @@ def uid_cache_put(uid, data):
 BAIDU_KEY_FILE = os.path.join(HERE, "baidu-keys.txt")            # 兼容旧中文名：百度同步密钥.txt
 BAIDU_KEY_FILE_OLD = os.path.join(HERE, "百度同步密钥.txt")
 BAIDU_CRED_FILE = os.path.join(HERE, "baidu-credential.json")     # 兼容旧中文名：百度凭证.json
+BAIDU_KEY_STORE = os.path.join(APP_DATA, "baidu-keys.json")
 BAIDU_OAUTH = "https://openapi.baidu.com/oauth/2.0"
 BAIDU_API = "https://pan.baidu.com/rest/2.0"               # 注意：路径 qs 以 /xpan/ 开头，这里不能带 xpan
 BAIDU_REDIRECT = "https://openapi.baidu.com/oauth/2.0/login_success"   # 桌面应用标准回跳页（显示授权码）
@@ -207,7 +216,10 @@ BAIDU_CLOUD_DIR = "/apps/原神养成记录"              # 应用专属目录�
 
 
 def baidu_keys():
-    """读密钥文件：两行 AppKey / SecretKey，容忍 'AppKey: xxx' 标签前缀"""
+    """读取已保存的密钥；没有安全存储时兼容旧版密钥文件。"""
+    stored = baidu_load_keys()
+    if stored:
+        return stored
     try:
         keyfile = BAIDU_KEY_FILE if os.path.exists(BAIDU_KEY_FILE) else BAIDU_KEY_FILE_OLD
         lines = [l.strip() for l in open(keyfile, encoding="utf-8") if l.strip()]
@@ -221,10 +233,63 @@ def baidu_keys():
             if v:
                 vals.append(v)
         if len(vals) >= 2 and vals[0] and vals[1]:
+            try:
+                baidu_save_keys(vals[0], vals[1])
+            except Exception:
+                pass
             return vals[0], vals[1]
     except Exception:
         pass
     return None
+
+
+def _dpapi(protect, value):
+    """Use Windows DPAPI for local-only secret storage."""
+    if os.name != "nt":
+        if protect:
+            return base64.b64encode(value.encode("utf-8")).decode("ascii")
+        return base64.b64decode(value).decode("utf-8")
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    raw = value.encode("utf-8") if protect else base64.b64decode(value)
+    src = ctypes.create_string_buffer(raw)
+    inp = Blob(len(raw), ctypes.cast(src, ctypes.POINTER(ctypes.c_char)))
+    out = Blob()
+    crypt = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not crypt(ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out)):
+        raise OSError("Windows 数据保护失败")
+    try:
+        result = ctypes.string_at(out.pbData, out.cbData)
+        return base64.b64encode(result).decode("ascii") if protect else result.decode("utf-8")
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def baidu_load_keys():
+    try:
+        with open(BAIDU_KEY_STORE, encoding="utf-8") as f:
+            data = json.load(f)
+        return _dpapi(False, data["app_key"]), _dpapi(False, data["secret_key"])
+    except Exception:
+        return None
+
+
+def baidu_save_keys(app_key, secret_key):
+    if not app_key or not secret_key:
+        raise ValueError("AppKey 和 SecretKey 不能为空")
+    data = {"app_key": _dpapi(True, app_key), "secret_key": _dpapi(True, secret_key)}
+    tmp = BAIDU_KEY_STORE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, BAIDU_KEY_STORE)
+
+
+def mask_secret(value):
+    if not value:
+        return ""
+    if len(value) <= 6:
+        return "*" * len(value)
+    return value[:3] + "*" * max(3, len(value) - 6) + value[-3:]
 
 
 def baidu_cred():
@@ -361,15 +426,70 @@ def baidu_upload(token, content):
 # ---------------- 抽卡记录同步（读游戏缓存 → 米哈游祈愿 API） ----------------
 # 原理：游戏内打开「祈愿历史记录」页面时，本机会留下带 authkey 的请求 URL（存于 webCaches 缓存，
 #       约 24 小时有效）；助手从缓存提取 URL → 调官方祈愿接口分页拉取全部记录。authkey 只在本机使用。
-GACHA_CACHE_BASE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Low", "miHoYo", "原神", "webCaches")
+GACHA_PATH_FILE = os.path.join(APP_DATA, "gacha-path.json")
 GACHA_TYPES = [301, 302, 200, 500, 100]        # 角色活动/武器活动/常驻/集录/新手
 GACHA_JOB = {"running": False, "done": False, "error": None, "records": None, "fetched": 0, "log": []}
 
+def gacha_saved_path():
+    try:
+        with open(GACHA_PATH_FILE, encoding="utf-8") as f:
+            path = str(json.load(f).get("path", "")).strip()
+        return path if path and os.path.exists(path) else ""
+    except Exception:
+        return ""
+
+
+def gacha_candidates():
+    local = os.environ.get("LOCALAPPDATA", "")
+    roaming = os.environ.get("APPDATA", "")
+    names = ["原神", "Genshin Impact", "GenshinImpact"]
+    out = []
+    for root in (os.path.join(local, "Low", "miHoYo"), os.path.join(local, "miHoYo"), os.path.join(roaming, "miHoYo")):
+        for name in names:
+            out.append(os.path.join(root, name, "webCaches"))
+    for drive in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = drive + ":\\"
+        out.extend(os.path.join(root, "Program Files", "HoYoPlay", name, "webCaches") for name in names)
+        out.extend(os.path.join(root, "Program Files (x86)", "HoYoPlay", name, "webCaches") for name in names)
+    return out
+
+
+def gacha_resolve_path(path):
+    path = os.path.abspath(path) if path else ""
+    if os.path.basename(path).lower() == "webcaches" and os.path.isdir(path):
+        return path
+    for candidate in (os.path.join(path, "webCaches"), os.path.join(path, "Genshin Impact", "webCaches")):
+        if os.path.isdir(candidate):
+            return candidate
+    return ""
+
+
+def gacha_cache_base():
+    saved = gacha_resolve_path(gacha_saved_path())
+    if saved:
+        return saved
+    for candidate in gacha_candidates():
+        resolved = gacha_resolve_path(candidate)
+        if resolved:
+            return resolved
+    return ""
+
+
+def gacha_save_path(path):
+    resolved = gacha_resolve_path(path)
+    if not resolved:
+        raise ValueError("未找到有效的原神 webCaches 目录")
+    with open(GACHA_PATH_FILE + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"path": path}, f, ensure_ascii=False)
+    os.replace(GACHA_PATH_FILE + ".tmp", GACHA_PATH_FILE)
+    return resolved
+
+
 def gacha_find_url():
     """从游戏 webCaches 里提取最近一次的祈愿历史 URL（含 authkey）→ (url, None) 或 (None, 错误)"""
-    base = GACHA_CACHE_BASE
+    base = gacha_cache_base()
     if not os.path.isdir(base):
-        return None, "没找到游戏缓存目录（原神需要装在这台电脑上）：" + base
+        return None, "未找到原神 webCaches 缓存目录，请先打开一次祈愿历史记录，或点击“设置游戏/缓存目录”"
     best = None
     for ver in os.listdir(base):
         f = os.path.join(base, ver, "Cache_Data", "data_2")
@@ -489,6 +609,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif path == "/ping":
             self._json({"helper": True})
+        elif path == "/heartbeat":
+            global LAST_HEARTBEAT
+            with HEARTBEAT_LOCK:
+                LAST_HEARTBEAT = time.time()
+            self._json({"ok": True})
         elif path == "/uid/sync":
             # UID 展柜同步（Enka，无需登录；多线路抓取 + 6 小时缓存，?refresh=1 强制刷新）
             try:
@@ -509,8 +634,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/baidu/status":
             keys = baidu_keys()
             cred = baidu_cred()
-            self._json({"hasKey": bool(keys), "authorized": bool(cred and cred.get("access_token")),
+            self._json({"hasKey": bool(keys),
+                        "appKey": mask_secret(keys[0]) if keys else "",
+                        "secretKey": mask_secret(keys[1]) if keys else "",
+                        "authorized": bool(cred and cred.get("access_token")),
                         "expires_at": (cred or {}).get("expires_at")})
+        elif path == "/gacha/config":
+            self._json({"ok": True, "path": gacha_saved_path(), "detected": gacha_cache_base()})
         elif path == "/baidu/authorize-url":
             keys = baidu_keys()
             if not keys:
@@ -572,6 +702,22 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             gacha_job_start([str(x) for x in (body.get("known_ids") or [])])
             self._json({"ok": True, "started": True})
+        elif parsed.path == "/baidu/keys":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                baidu_save_keys(str(body.get("appKey", "")).strip(), str(body.get("secretKey", "")).strip())
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+        elif parsed.path == "/gacha/path":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                resolved = gacha_save_path(str(body.get("path", "")).strip())
+                self._json({"ok": True, "path": resolved})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
         elif parsed.path == "/baidu/exchange":
             keys = baidu_keys()
             try:
@@ -617,6 +763,16 @@ class HelperServer(ThreadingHTTPServer):
 
 SERVER = None
 
+
+def heartbeat_watchdog():
+    while True:
+        time.sleep(5)
+        with HEARTBEAT_LOCK:
+            stale = time.time() - LAST_HEARTBEAT
+        if stale > HEARTBEAT_TIMEOUT and SERVER is not None:
+            threading.Thread(target=SERVER.shutdown, daemon=True).start()
+            return
+
 def open_app_window():
     """用 Edge/Chrome 的应用模式打开（无地址栏，看起来像独立软件）"""
     url = f"http://127.0.0.1:{PORT}"
@@ -641,6 +797,7 @@ def main():
         print("助手已在运行，仅重新打开窗口")
         return
     SERVER = HelperServer(("127.0.0.1", PORT), Handler)
+    threading.Thread(target=heartbeat_watchdog, daemon=True).start()
     SERVER.serve_forever()
 
 

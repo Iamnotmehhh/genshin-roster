@@ -16,8 +16,10 @@ const dir = __dirname;
 const htmlPath = path.join(dir, "index.html");
 let html = fs.readFileSync(htmlPath, "utf8");
 
-const cfgRaw = fs.readFileSync(path.join(dir, "..", "流派配置.json"), "utf8").trim();
-let engine = fs.readFileSync(path.join(dir, "..", "artifact-judge.js"), "utf8");
+const parentDir = path.join(dir, "..");
+const dataDir = fs.existsSync(path.join(dir, "流派配置.json")) ? dir : parentDir;
+const cfgRaw = fs.readFileSync(path.join(dataDir, "流派配置.json"), "utf8").trim();
+let engine = fs.readFileSync(path.join(dataDir, "artifact-judge.js"), "utf8");
 
 /* 引擎改造：剥掉头注释（内有 require 用法说明会误报警卫）、去 fs/path、
    CFG 换成注入对象、砍掉 CLI 演示段 */

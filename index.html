@@ -588,6 +588,12 @@ details.legend summary { cursor: pointer; }
     <button id="btnGachaCsv">导出 CSV</button>
     <label class="hint">卡池 <select id="gachaPoolFilter" style="max-width:130px;"></select></label>
     <span class="hint" id="gachaStatus" style="flex:1;">需要在这台电脑上安装原神，并先在游戏里打开一次「祈愿历史记录」页面</span>
+    <button id="btnGachaPath">设置游戏/缓存目录</button>
+  </div>
+  <div id="gachaPathArea" class="hint" style="margin-top:6px;display:none;">
+    <input id="gachaPathInput" placeholder="输入原神游戏目录或 webCaches 目录" style="width:min(420px,80vw);">
+    <button id="btnGachaPathSave">保存目录</button>
+    <span id="gachaPathStatus"></span>
   </div>
   <div class="af-stats" id="gachaStats"></div>
   <div id="gachaTableArea"></div>
@@ -797,6 +803,15 @@ details.legend summary { cursor: pointer; }
     </div>
     <div id="baiduSection" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <span id="baiduStatus" class="hint">检查中……</span>
+    </div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);">
+      <div class="hint">同步 Key（仅保存在本机，界面不会显示完整内容）</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;">
+        <input id="baiduAppKey" placeholder="AppKey" autocomplete="off" style="flex:1;min-width:160px;">
+        <input id="baiduSecretKey" placeholder="SecretKey" autocomplete="off" style="flex:1;min-width:160px;">
+        <button type="button" id="btnBaiduSaveKeys">保存 Key</button>
+      </div>
+      <div id="baiduKeyHint" class="hint" style="margin-top:4px;"></div>
     </div>
     <div id="baiduAuthArea" style="display:none;margin-top:8px;">
       <div class="hint" style="line-height:1.8;">① 点「去授权」→ 在打开的百度页面登录并点「授权」→ ② 页面会显示一串<b>授权码</b> → ③ 复制到下面输入框点「完成授权」（只需一次，凭证存本机）</div>
@@ -5048,6 +5063,7 @@ function init() {
     .then(r => r.json()).then(j => j.helper === true).catch(() => false);
   let helperOK = false;
   HELPER().then(ok => { helperOK = ok; document.getElementById("btnMhy").style.display = ok ? "" : "none"; });
+  setInterval(() => fetch("/heartbeat", { method: "GET", signal: AbortSignal.timeout(1500) }).catch(() => {}), 5000);
   document.getElementById("btnMhy").onclick = async () => {
     helperOK = await HELPER();
     document.getElementById("mhyDialog").showModal();
@@ -5069,7 +5085,9 @@ function init() {
     const syncArea = document.getElementById("baiduSyncArea");
     try {
       const st = await fetch("/baidu/status").then(r => r.json());
-      if (!st.hasKey) { stBox.innerHTML = '未配置：在助手目录放 <b>百度同步密钥.txt</b>（两行 AppKey/SecretKey）后刷新页面'; authArea.style.display = "none"; syncArea.style.display = "none"; return false; }
+      const keyHint = document.getElementById("baiduKeyHint");
+      if (keyHint) keyHint.textContent = st.hasKey ? `当前 Key：${st.appKey} / ${st.secretKey}` : "尚未配置 Key";
+      if (!st.hasKey) { stBox.textContent = "尚未配置百度同步 Key，请在此处保存"; authArea.style.display = "none"; syncArea.style.display = "none"; return false; }
       if (!st.authorized) { stBox.textContent = "已检测到密钥，尚未授权百度网盘"; authArea.style.display = ""; syncArea.style.display = "none"; return false; }
       stBox.textContent = "✅ 已授权百度网盘";
       authArea.style.display = "none"; syncArea.style.display = "";
@@ -5078,6 +5096,19 @@ function init() {
       return true;
     } catch (e) { stBox.textContent = "助手未响应"; return false; }
   }
+  document.getElementById("btnBaiduSaveKeys").onclick = async () => {
+    const appKey = document.getElementById("baiduAppKey").value.trim();
+    const secretKey = document.getElementById("baiduSecretKey").value.trim();
+    if (!appKey || !secretKey) { alert("请填写 AppKey 和 SecretKey"); return; }
+    const j = await fetch("/baidu/keys", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ appKey, secretKey })
+    }).then(r => r.json());
+    if (!j.ok) { alert("保存 Key 失败：" + (j.error || "未知错误")); return; }
+    document.getElementById("baiduAppKey").value = "";
+    document.getElementById("baiduSecretKey").value = "";
+    await baiduStatusCheck();
+  };
   document.getElementById("btnBaiduAuth").onclick = async () => {
     const j = await fetch("/baidu/authorize-url").then(r => r.json());
     if (!j.ok) { alert(j.error); return; }
@@ -5302,7 +5333,7 @@ function init() {
   }
   document.getElementById("btnUidSync").onclick = async () => {
     if (!helperOK) { alert("助手未运行"); return; }
-    const st = document.getElementById("uidSyncStatus");
+    const st = document.getElementById("mhyStatus");
     const uid = document.getElementById("syncUid").value.trim();
     if (!/^\d{9}$/.test(uid)) { st.textContent = "请输入 9 位数字 UID"; return; }
     st.textContent = "正在从 Enka 展柜拉取（多线路，最长约 1 分钟）……";
@@ -5310,7 +5341,8 @@ function init() {
     btn.disabled = true;
     try {
       const refresh = document.getElementById("syncRefresh").checked ? "&refresh=1" : "";
-      const data = await fetch("/uid/sync?uid=" + encodeURIComponent(uid) + refresh).then(r => r.json());
+      const data = await fetch("/uid/sync?uid=" + encodeURIComponent(uid) + refresh,
+        { signal: AbortSignal.timeout(90000) }).then(r => r.json());
       if (!data.ok) { st.textContent = "❌ " + (data.error || "未知错误"); return; }
       const opts = {
         alloc: document.getElementById("syncToAlloc").checked,
@@ -5506,6 +5538,29 @@ document.addEventListener("DOMContentLoaded", init);
         break;
       }
     } catch (e) { st.innerHTML = '<span style="color:var(--warn-red);">' + escapeHtml(e.message) + '</span>'; }
+  };
+  document.getElementById("btnGachaPath").onclick = async () => {
+    const area = document.getElementById("gachaPathArea");
+    area.style.display = area.style.display === "none" ? "" : "none";
+    if (area.style.display === "") {
+      try {
+        const j = await fetch("/gacha/config").then(r => r.json());
+        document.getElementById("gachaPathInput").value = j.path || j.detected || "";
+        document.getElementById("gachaPathStatus").textContent = j.detected ? "已检测到缓存目录" : "未检测到，请填写目录";
+      } catch (e) {
+        document.getElementById("gachaPathStatus").textContent = "助手未响应";
+      }
+    }
+  };
+  document.getElementById("btnGachaPathSave").onclick = async () => {
+    const path = document.getElementById("gachaPathInput").value.trim();
+    const st = document.getElementById("gachaPathStatus");
+    if (!path) { st.textContent = "请填写目录"; return; }
+    const j = await fetch("/gacha/path", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ path })
+    }).then(r => r.json());
+    st.textContent = j.ok ? "目录已保存" : (j.error || "目录无效");
   };
 </script>
 

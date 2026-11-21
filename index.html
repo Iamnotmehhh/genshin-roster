@@ -485,6 +485,7 @@ details.legend summary { cursor: pointer; }
   <div class="header-row">
     <h1>原神角色养成记录</h1>
     <span class="spacer"></span>
+    <span id="appLastUpdate" class="hint" style="color:var(--muted);">最新更新时间：暂无</span>
     <span id="storageStatus">数据存于浏览器本地</span>
   </div>
   <div class="header-row" style="margin-top:8px;">
@@ -586,6 +587,8 @@ details.legend summary { cursor: pointer; }
   <div class="toolbar-row">
     <button id="btnGachaSync" class="primary">🎴 从游戏同步</button>
     <button id="btnGachaCsv">导出 CSV</button>
+    <button id="btnGachaImport">导入 Excel/CSV</button>
+    <input id="gachaImportFile" type="file" accept=".xlsx,.xls,.csv,.tsv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;">
     <label class="hint">卡池 <select id="gachaPoolFilter" style="max-width:130px;"></select></label>
     <span class="hint" id="gachaStatus" style="flex:1;">需要在这台电脑上安装原神，并先在游戏里打开一次「祈愿历史记录」页面</span>
     <button id="btnGachaPath">设置游戏/缓存目录</button>
@@ -3960,6 +3963,20 @@ let fileHandle = null;            // 已连接的数据文件句柄（File Syste
    ========================================================================== */
 const LS_KEY = "genshin-roster-data";
 
+function updateAppLastUpdate() {
+  const el = document.getElementById("appLastUpdate");
+  if (!el) return;
+  let ms = 0;
+  try { ms = Number(localStorage.getItem("genshin-roster-lastchange") || 0); } catch (e) {}
+  if (!ms) {
+    el.textContent = "最新更新时间：暂无";
+    return;
+  }
+  const d = new Date(ms);
+  const pad = n => String(n).padStart(2, "0");
+  el.textContent = `最新更新时间：${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function loadLocal() {
   try {
     const raw = localStorage.getItem(LS_KEY);
@@ -3971,6 +3988,7 @@ function saveAll() {
   // 1) 先存 localStorage（立即、同步、永远有效）
   try { localStorage.setItem(LS_KEY, JSON.stringify(db)); } catch (e) {}
   try { localStorage.setItem("genshin-roster-lastchange", String(Date.now())); } catch (e) {}
+  updateAppLastUpdate();
   // 2) 再写数据文件（如果有连接）
   if (fileHandle) writeFile().catch(err => setStatus("写入文件失败：" + err.message, "error"));
 }
@@ -5516,6 +5534,43 @@ document.addEventListener("DOMContentLoaded", init);
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 3000);
   };
+  document.getElementById("btnGachaImport").onclick = () => document.getElementById("gachaImportFile").click();
+  document.getElementById("gachaImportFile").onchange = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const st = document.getElementById("gachaStatus");
+    try {
+      if (/\.xls$/i.test(file.name)) throw new Error("暂不支持旧版 .xls，请先在 Excel 中另存为 .xlsx 或 CSV");
+      const data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+      st.textContent = "正在解析导入文件……";
+      const j = await fetch("/gacha/import", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ filename: file.name, data })
+      }).then(r => r.json());
+      if (!j.ok) throw new Error(j.error || "导入失败");
+      const exist = new Map(gachaRecords().map(r => [String(r.id), r]));
+      let added = 0;
+      for (const r of j.records) {
+        if (!exist.has(String(r.id))) {
+          exist.set(String(r.id), r);
+          added++;
+        }
+      }
+      db.gachaWishes = { records: [...exist.values()].sort((a, b) => Number(a.id) - Number(b.id)) };
+      saveAll(); gachaRender();
+      st.textContent = `✅ 导入完成：文件包含 ${j.records.length} 条，新增 ${added} 条`;
+    } catch (err) {
+      st.innerHTML = '<span style="color:var(--warn-red);">' + escapeHtml(err.message) + '</span>';
+    } finally {
+      e.target.value = "";
+    }
+  };
   document.getElementById("btnGachaSync").onclick = async () => {
     const st = document.getElementById("gachaStatus");
     try {
@@ -6290,6 +6345,8 @@ function afMatchSet(tok) {
 /* ---------------- 存取 ---------------- */
 function afSave() {
   try { localStorage.setItem(AF_LS_KEY, JSON.stringify(afData)); } catch (e) {}
+  try { localStorage.setItem("genshin-roster-lastchange", String(Date.now())); } catch (e) {}
+  if (typeof updateAppLastUpdate === "function") updateAppLastUpdate();
 }
 function afLoad() {
   try {
@@ -6796,6 +6853,7 @@ function afSwitch(view) {
 }
 
 function initAF() {
+  updateAppLastUpdate();
   afLoad();
   /* 套装下拉清单：内置快照 + 上次「更新角色库」缓存的 wiki 数据合并（datalist：点击弹出选择，也允许直接输入清单外的新套装） */
   if (window.AF_SET_DB_WIKI) afApplySetDB(window.AF_SET_DB_WIKI);

@@ -14,11 +14,15 @@
 """
 import hashlib
 import base64
+import io
+import zipfile
+import xml.etree.ElementTree as ET
 import ctypes
 from ctypes import wintypes
 import json
 import re
 import os
+import csv
 import subprocess
 import sys
 import threading
@@ -551,6 +555,118 @@ def gacha_save_path(path):
     return resolved
 
 
+def gacha_parse_xlsx(raw):
+    """读取 XLSX 第一张工作表，不依赖第三方 Excel 库。"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            shared = []
+            try:
+                root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                for si in root.findall("m:si", ns):
+                    text = "".join(t.text or "" for t in si.iter("{%s}t" % ns["m"]))
+                    shared.append(text)
+            except Exception:
+                pass
+            sheet_root = ET.fromstring(z.read("xl/worksheets/sheet1.xml"))
+            ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            rows = []
+            for row in sheet_root.findall(".//m:sheetData/m:row", ns):
+                values = {}
+                for cell in row.findall("m:c", ns):
+                    ref = cell.attrib.get("r", "")
+                    col_letters = re.match(r"[A-Z]+", ref)
+                    col = 0
+                    if col_letters:
+                        for ch in col_letters.group(0):
+                            col = col * 26 + ord(ch) - 64
+                        col -= 1
+                    kind = cell.attrib.get("t")
+                    value = ""
+                    if kind == "inlineStr":
+                        value = "".join(t.text or "" for t in cell.findall(".//m:t", ns))
+                    else:
+                        v = cell.find("m:v", ns)
+                        if v is not None:
+                            value = v.text or ""
+                            if kind == "s":
+                                try:
+                                    value = shared[int(value)]
+                                except Exception:
+                                    pass
+                    values[col] = value
+                if values:
+                    rows.append([values.get(i, "") for i in range(max(values.keys()) + 1)])
+            return rows
+    except Exception as e:
+        raise RuntimeError("无法读取 Excel .xlsx 文件：" + str(e))
+
+
+def gacha_parse_import(raw, filename):
+    name = filename.lower()
+    if name.endswith(".xlsx"):
+        rows = gacha_parse_xlsx(raw)
+    else:
+        text = raw.decode("utf-8-sig", "replace")
+        dialect = csv.excel_tab if "\t" in text.splitlines()[0] else csv.excel
+        rows = list(csv.reader(text.splitlines(), dialect=dialect))
+    if not rows:
+        raise RuntimeError("文件中没有数据")
+
+    pool_names = {"角色活动祈愿": 301, "武器活动祈愿": 302, "常驻祈愿": 200,
+                  "集录祈愿": 500, "新手祈愿": 100}
+    header_index = -1
+    headers = []
+    for i, row in enumerate(rows[:20]):
+        cleaned = [str(v).strip().replace('"', "") for v in row]
+        if any("时间" in v or "time" in v.lower() for v in cleaned) and any(
+            "物品" in v or "名称" in v or "name" in v.lower() or "item" in v.lower() for v in cleaned):
+            header_index = i
+            headers = cleaned
+            break
+    if header_index < 0:
+        raise RuntimeError("未找到抽卡记录表头，请使用本软件导出的 CSV，或包含“时间、卡池、物品、星级”的 Excel")
+
+    normalized = [h.lower().replace(" ", "") for h in headers]
+    def find(*names):
+        for i, h in enumerate(normalized):
+            if any(n in h for n in names):
+                return i
+        return -1
+    time_i = find("时间", "time", "date")
+    pool_i = find("卡池", "pool", "banner")
+    item_i = find("物品", "名称", "name", "item")
+    rank_i = find("星级", "rank", "rarity", "star")
+
+    records = []
+    for row in rows[header_index + 1:]:
+        if len(row) <= max(i for i in (time_i, pool_i, item_i, rank_i) if i >= 0):
+            continue
+        time_value = str(row[time_i]).strip() if time_i >= 0 else ""
+        pool_value = str(row[pool_i]).strip() if pool_i >= 0 else ""
+        item = str(row[item_i]).strip() if item_i >= 0 else ""
+        rank_value = str(row[rank_i]).strip() if rank_i >= 0 else ""
+        if not item:
+            continue
+        rank_match = re.search(r"\d", rank_value)
+        rank = int(rank_match.group(0)) if rank_match else (5 if "★★★★★" in rank_value else 4)
+        gacha_type = pool_names.get(pool_value, 200)
+        if re.search(r"\d", pool_value):
+            try:
+                gacha_type = int(re.sub(r"[^\d]", "", pool_value))
+            except Exception:
+                pass
+        seed = f"{time_value}|{pool_value}|{item}|{rank}"
+        record_id = str(int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12], 16))
+        records.append({"uid": "", "gacha_type": gacha_type, "item_id": "",
+                        "count": "1", "time": time_value, "name": item,
+                        "lang": "zh-cn", "item_type": "", "rank_type": rank,
+                        "id": record_id})
+    if not records:
+        raise RuntimeError("表格中没有可导入的祈愿记录")
+    return records
+
+
 def gacha_find_url():
     """从游戏 webCaches 里提取最近一次的祈愿历史 URL（含 authkey）→ (url, None) 或 (None, 错误)"""
     base = gacha_cache_base()
@@ -777,6 +893,15 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             gacha_job_start([str(x) for x in (body.get("known_ids") or [])])
             self._json({"ok": True, "started": True})
+        elif parsed.path == "/gacha/import":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                raw = base64.b64decode(str(body.get("data", "")), validate=True)
+                records = gacha_parse_import(raw, str(body.get("filename", "")).strip())
+                self._json({"ok": True, "records": records})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
         elif parsed.path == "/baidu/keys":
             try:
                 length = int(self.headers.get("Content-Length", 0))

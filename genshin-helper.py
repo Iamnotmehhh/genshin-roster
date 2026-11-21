@@ -442,6 +442,7 @@ def gacha_saved_path():
 def gacha_candidates():
     local = os.environ.get("LOCALAPPDATA", "")
     roaming = os.environ.get("APPDATA", "")
+    profile = os.environ.get("USERPROFILE", "")
     names = ["原神", "Genshin Impact", "GenshinImpact"]
     out = []
     for root in (os.path.join(local, "Low", "miHoYo"), os.path.join(local, "miHoYo"), os.path.join(roaming, "miHoYo")):
@@ -451,6 +452,45 @@ def gacha_candidates():
         root = drive + ":\\"
         out.extend(os.path.join(root, "Program Files", "HoYoPlay", name, "webCaches") for name in names)
         out.extend(os.path.join(root, "Program Files (x86)", "HoYoPlay", name, "webCaches") for name in names)
+        for launcher in ("miHoYo Launcher", "HoYoPlay"):
+            out.append(os.path.join(root, "Data", launcher, "games"))
+        out.extend((
+            os.path.join(root, "miHoYo Launcher", "games", "Genshin Impact"),
+            os.path.join(root, "HoYoPlay", "games", "Genshin Impact"),
+        ))
+    if profile:
+        out.append(os.path.join(profile, "Documents", "miHoYo", "Genshin Impact"))
+    if sys.platform == "win32":
+        try:
+            import winreg
+            uninstall_roots = (
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            )
+            for hive, key_path in uninstall_roots:
+                try:
+                    with winreg.OpenKey(hive, key_path) as key:
+                        for i in range(winreg.QueryInfoKey(key)[0]):
+                            try:
+                                with winreg.OpenKey(key, winreg.EnumKey(key, i)) as sub:
+                                    values = {}
+                                    for value_name in ("DisplayName", "InstallLocation", "DisplayIcon"):
+                                        try:
+                                            values[value_name] = winreg.QueryValueEx(sub, value_name)[0]
+                                        except Exception:
+                                            pass
+                                    text = " ".join(str(v) for v in values.values()).lower()
+                                    if "genshin" in text or "mihoyo" in text or "hoyoplay" in text:
+                                        install = str(values.get("InstallLocation", "")).strip().strip('"')
+                                        if install:
+                                            out.append(install)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return out
 
 
@@ -458,9 +498,35 @@ def gacha_resolve_path(path):
     path = os.path.abspath(path) if path else ""
     if os.path.basename(path).lower() == "webcaches" and os.path.isdir(path):
         return path
-    for candidate in (os.path.join(path, "webCaches"), os.path.join(path, "Genshin Impact", "webCaches")):
+    ancestor = path
+    while os.path.isdir(ancestor):
+        if os.path.basename(ancestor).lower() == "webcaches":
+            return ancestor
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
+    for candidate in (
+        os.path.join(path, "webCaches"),
+        os.path.join(path, "Genshin Impact", "webCaches"),
+        os.path.join(path, "Genshin Impact Game", "webCaches"),
+        os.path.join(path, "games", "Genshin Impact", "Genshin Impact Game", "webCaches"),
+    ):
         if os.path.isdir(candidate):
             return candidate
+    if os.path.isdir(path):
+        try:
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d.lower() not in ("node_modules", ".git", "__pycache__", "cache")]
+                rel = os.path.relpath(root, path)
+                depth = 0 if rel == "." else len(rel.split(os.sep))
+                if depth > 6:
+                    dirs[:] = []
+                    continue
+                if os.path.basename(root).lower() == "webcaches":
+                    return root
+        except Exception:
+            pass
     return ""
 
 
@@ -490,18 +556,27 @@ def gacha_find_url():
     base = gacha_cache_base()
     if not os.path.isdir(base):
         return None, "未找到原神 webCaches 缓存目录，请先打开一次祈愿历史记录，或点击“设置游戏/缓存目录”"
-    best = None
-    for ver in os.listdir(base):
-        f = os.path.join(base, ver, "Cache_Data", "data_2")
-        if os.path.isfile(f) and (best is None or ver > best[0]):
-            best = (ver, f)
-    if not best:
-        return None, "缓存目录里没有 data_2 文件"
+    data_files = []
     try:
-        data = open(best[1], "rb").read().decode("utf-8", "replace")
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d.lower() not in ("node_modules", ".git", "__pycache__")]
+            if "data_2" in files:
+                data_files.append(os.path.join(root, "data_2"))
+    except Exception as e:
+        return None, "扫描缓存失败：" + str(e)
+    if not data_files:
+        return None, "缓存目录里没有 data_2 文件"
+    best = max(data_files, key=lambda f: os.path.getmtime(f))
+    try:
+        data = open(best, "rb").read().decode("utf-8", "replace")
+        data = data.replace("\x00", "")
+        data = re.sub(r"[\r\n\t]", "", data)
     except Exception as e:
         return None, "读取缓存失败：" + str(e)
-    urls = re.findall(r'https://public-operation-hk4e\.mihoyo\.com/gacha_info/api/getGachaLog[^\s"\'\\]*', data)
+    urls = re.findall(
+        r'https://(?:public-operation-hk4e\.mihoyo\.com|hk4e-api\.mihoyo\.com|hk4e-api-os\.hoyoverse\.com)/gacha_info/api/getGachaLog[^\s"\'<>]*',
+        data,
+    )
     if not urls:
         return None, "缓存里没有抽卡记录 URL——请先在游戏里打开一次「祈愿历史记录」页面，再回来点同步"
     return urls[-1].replace("&", "&"), None
